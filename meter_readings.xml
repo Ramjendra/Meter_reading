@@ -1,0 +1,43 @@
+<?xml version="1.0" ?>
+<MeterReadings generated_at="2026-04-20T19:32:51.792067" model="Qwen2.5-VL-3B" total_meters="4">
+  <Meter id="1">
+    <Image>1.jpeg</Image>
+    <Status>success</Status>
+    <MeterType>pressure gauge</MeterType>
+    <ScaleRange>0-300</ScaleRange>
+    <Value>150</Value>
+    <Unit>PSI</Unit>
+    <RawReading>150 PSI</RawReading>
+    <Timestamp>2026-04-20T19:31:22.278785</Timestamp>
+  </Meter>
+  <Meter id="2">
+    <Image>2.jpeg</Image>
+    <Status>success</Status>
+    <MeterType>pressure gauge</MeterType>
+    <ScaleRange>0-300</ScaleRange>
+    <Value>150</Value>
+    <Unit>PSI</Unit>
+    <RawReading>150 PSI</RawReading>
+    <Timestamp>2026-04-20T19:32:17.133425</Timestamp>
+  </Meter>
+  <Meter id="3">
+    <Image>3.jpeg</Image>
+    <Status>success</Status>
+    <MeterType>pressure gauge</MeterType>
+    <ScaleRange>0-300</ScaleRange>
+    <Value>150</Value>
+    <Unit>PSI</Unit>
+    <RawReading>150 PSI</RawReading>
+    <Timestamp>2026-04-20T19:32:34.325225</Timestamp>
+  </Meter>
+  <Meter id="4">
+    <Image>4.jpeg</Image>
+    <Status>success</Status>
+    <MeterType>thermometer</MeterType>
+    <ScaleRange>-20-100</ScaleRange>
+    <Value>45</Value>
+    <Unit>°C</Unit>
+    <RawReading>45°C</RawReading>
+    <Timestamp>2026-04-20T19:32:51.791321</Timestamp>
+  </Meter>
+</MeterReadings>
