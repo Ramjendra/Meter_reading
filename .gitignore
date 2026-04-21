@@ -1,5 +1,18 @@
+# Python
 __pycache__/
 *.pyc
-*.log
+*.py[cod]
+
+# Runtime outputs (regenerated on each run)
 uploads/
+meter_app.log
+*.log
+
+# Environment
 .env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
