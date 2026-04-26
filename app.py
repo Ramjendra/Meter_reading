@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import cv2
+import numpy as np
 from flask import Flask, request, jsonify, send_from_directory
 import torch
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -85,58 +87,215 @@ log.info(f"Model ready on {device}  (load time: {time.time()-t0:.1f}s)")
 log.info("-" * 60)
 
 
-# ─── Inference helpers ────────────────────────────────────────────────────────
+# ─── VLM helper (scale / type / unit only) ───────────────────────────────────
 
-COMBINED_PROMPT = (
-    "Look at this analog meter image and answer all three questions in one line, "
-    "using exactly this format:\n"
-    "TYPE: <instrument type> | SCALE: <min>-<max> | READING: <value> <unit>\n\n"
-    "Example: TYPE: pressure gauge | SCALE: 0-300 | READING: 120 PSI\n"
-    "Now answer for this image:"
+SCALE_PROMPT = (
+    "Examine this analog meter dial carefully.\n\n"
+    "Answer these six questions:\n"
+    "1. Instrument type (thermometer, pressure gauge, voltmeter, etc.)\n"
+    "2. The LOWEST number printed on the °C or primary scale (ignore °F/secondary scale)\n"
+    "3. The HIGHEST number printed on the °C or primary scale\n"
+    "4. The measurement unit (°C, PSI, bar, V, etc.)\n"
+    "5. At which CLOCK HOUR (1–12) is the LOWEST number located on the dial?\n"
+    "6. At which CLOCK HOUR (1–12) is the HIGHEST number located on the dial?\n\n"
+    "Reply in EXACTLY this format:\n"
+    "TYPE: <type> | MIN: <number> | MAX: <number> | UNIT: <unit> | MIN_CLOCK: <1-12> | MAX_CLOCK: <1-12>\n\n"
+    "Examples:\n"
+    "TYPE: thermometer | MIN: -10 | MAX: 120 | UNIT: °C | MIN_CLOCK: 7 | MAX_CLOCK: 5\n"
+    "TYPE: pressure gauge | MIN: 0 | MAX: 300 | UNIT: PSI | MIN_CLOCK: 8 | MAX_CLOCK: 4"
 )
 
 
-def read_meter(img: Image.Image) -> dict:
-    log.info("  Running single inference pass …")
-    t0 = time.time()
-
+def _infer(img: Image.Image, prompt_text: str, max_tokens: int = 50) -> str:
     messages = [{"role": "user", "content": [
         {"type": "image", "image": img},
-        {"type": "text",  "text": COMBINED_PROMPT},
+        {"type": "text",  "text": prompt_text},
     ]}]
     prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[prompt], images=[img], return_tensors="pt").to(device)
-
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=60, do_sample=False)
-
+        out = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
     new_tokens = out[0][inputs["input_ids"].shape[1]:]
-    answer = processor.decode(new_tokens, skip_special_tokens=True).strip()
-    elapsed = time.time() - t0
-    log.debug(f"  Raw answer: {answer}  ({elapsed:.2f}s)")
-
-    # Parse structured response
-    meter_type  = _extract_field(answer, "TYPE")
-    scale_range = _extract_field(answer, "SCALE")
-    reading     = _extract_field(answer, "READING")
-
-    numbers = re.findall(r"-?\d+\.?\d*", reading)
-    m = UNIT_RE.search(reading)
-    result = {
-        "meter_type":  meter_type,
-        "scale_range": scale_range,
-        "raw_reading": reading,
-        "value":       numbers[0] if numbers else "—",
-        "unit":        m.group() if m else "",
-        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    log.info(f"  Done in {elapsed:.1f}s  →  {result['value']} {result['unit']}  ({result['meter_type']})")
-    return result
+    return processor.decode(new_tokens, skip_special_tokens=True).strip()
 
 
 def _extract_field(text: str, key: str) -> str:
     m = re.search(rf"{key}\s*:\s*([^|]+)", text, re.IGNORECASE)
     return m.group(1).strip().rstrip(".") if m else text.strip()
+
+
+# ─── CV needle detection ──────────────────────────────────────────────────────
+
+def _find_gauge_center(gray: np.ndarray):
+    """Return (cx, cy, r) for the largest circular dial found, or image-center fallback."""
+    h, w = gray.shape
+    blurred = cv2.GaussianBlur(gray, (11, 11), 2)
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT, dp=1.5,
+        minDist=min(h, w) // 2,
+        param1=100, param2=30,
+        minRadius=min(h, w) // 5,
+        maxRadius=min(h, w) // 2,
+    )
+    if circles is not None:
+        cx, cy, r = map(int, np.round(circles[0][0]))
+        log.debug(f"  CV: circle found at ({cx},{cy}) r={r}")
+        return cx, cy, r
+    cx, cy = w // 2, h // 2
+    r = int(min(h, w) * 0.45)
+    log.debug(f"  CV: no circle, using image centre ({cx},{cy}) r={r}")
+    return cx, cy, r
+
+
+def detect_needle_angle(img_pil: Image.Image) -> tuple:
+    """
+    Detect needle angle by radial sweep from the gauge centre.
+
+    Returns (angle_deg, cx, cy, r) where angle_deg is 0–359 in image-atan2
+    convention: 0 = right, increases clockwise (y-down axis).
+
+    Geometry (y-down, 0-360 increasing CW):
+        3 o'clock =   0°   6 o'clock =  90°
+        9 o'clock = 180°  12 o'clock = 270°
+        7:30 pos  = 135°   4:30 pos  =  45°
+    """
+    img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    cx, cy, r = _find_gauge_center(gray)
+
+    # Radial sweep: for each angle sample darkness along the ray
+    # (inner 12 % = centre hub, outer 20 % = scale ring — both excluded)
+    r_inner = max(4, int(r * 0.12))
+    r_outer = int(r * 0.80)
+    n_pts   = 80
+
+    scores = np.zeros(360, dtype=np.float64)
+    for a in range(360):
+        rad = np.radians(a)
+        t   = np.linspace(r_inner, r_outer, n_pts)
+        xs  = np.clip((cx + t * np.cos(rad)).astype(int), 0, w - 1)
+        ys  = np.clip((cy + t * np.sin(rad)).astype(int), 0, h - 1)
+        scores[a] = np.sum(255.0 - gray[ys, xs])   # dark pixels score higher
+
+    # Circular mean-smooth (kernel = 7°) to suppress isolated tick marks
+    k = 7
+    kernel  = np.ones(k) / k
+    padded  = np.concatenate([scores[-k:], scores, scores[:k]])
+    smoothed = np.convolve(padded, kernel, mode="same")[k: k + 360]
+
+    candidate = int(np.argmax(smoothed))
+
+    # Pick tip vs tail: the TIP end is farther from centre and typically darker
+    def darkness_near_rim(angle: int) -> float:
+        rad = np.radians(angle)
+        rx = int(np.clip(cx + r * 0.75 * np.cos(rad), 0, w - 1))
+        ry = int(np.clip(cy + r * 0.75 * np.sin(rad), 0, h - 1))
+        return float(255 - gray[ry, rx])
+
+    opposite = (candidate + 180) % 360
+    if darkness_near_rim(opposite) > darkness_near_rim(candidate):
+        candidate = opposite
+
+    log.debug(f"  CV: needle angle = {candidate}°  (centre={cx},{cy} r={r})")
+    return candidate, cx, cy, r
+
+
+def clock_to_atan2(clock_hour: float) -> int:
+    """
+    Convert a clock-face hour (1–12) to image-atan2 angle (0–359, y-down CW).
+
+    12 o'clock → 270°   3 o'clock →   0°
+     6 o'clock →  90°   9 o'clock → 180°
+    """
+    return int((270 + clock_hour * 30) % 360)
+
+
+def angle_to_reading(
+    needle_angle: int,
+    scale_min: float,
+    scale_max: float,
+    min_clock: float = 7.5,
+    max_clock: float = 4.5,
+) -> float:
+    """
+    Map needle angle (image-atan2, 0-359 CW) to a scale reading.
+
+    min_clock / max_clock are the clock-face hours (1–12, fractions OK)
+    where the MIN and MAX values of the scale are marked.
+    The scale sweeps CLOCKWISE from min_clock to max_clock through 12 o'clock.
+
+    Default 7.5 → 4.5 = 270° sweep, matching most standard analog gauges.
+    """
+    a_min = clock_to_atan2(min_clock)   # atan2 angle at MIN value
+    a_max = clock_to_atan2(max_clock)   # atan2 angle at MAX value
+
+    # Sweep: CW from a_min to a_max (CW = increasing atan2 mod 360)
+    sweep = (a_max - a_min) % 360
+    if sweep < 45:          # degenerate — fall back to 270°
+        sweep = 270
+
+    delta    = (needle_angle - a_min) % 360
+    fraction = float(np.clip(delta / sweep, 0.0, 1.0))
+    return round(scale_min + fraction * (scale_max - scale_min), 1)
+
+
+# ─── Main meter reading pipeline ─────────────────────────────────────────────
+
+def read_meter(img: Image.Image) -> dict:
+    t0 = time.time()
+
+    # Step 1 — VLM reads scale text + clock positions of min/max marks
+    log.info("  Step 1 (VLM): reading scale + clock positions …")
+    scale_ans  = _infer(img, SCALE_PROMPT, max_tokens=70)
+    meter_type = _extract_field(scale_ans, "TYPE")
+    unit_str   = _extract_field(scale_ans, "UNIT")
+    log.debug(f"  VLM answer: {scale_ans}")
+
+    # Parse MIN / MAX (separate fields to avoid "-20-120" ambiguity)
+    min_raw = re.findall(r"-?\d+\.?\d*", _extract_field(scale_ans, "MIN"))
+    max_raw = re.findall(r"-?\d+\.?\d*", _extract_field(scale_ans, "MAX"))
+    s_min = float(min_raw[0]) if min_raw else 0.0
+    s_max = float(max_raw[0]) if max_raw else 100.0
+    u = UNIT_RE.search(unit_str)
+    unit = u.group() if u else unit_str.strip()
+
+    # Parse clock positions (1–12) for scale calibration
+    min_clk_raw = re.findall(r"\d+\.?\d*", _extract_field(scale_ans, "MIN_CLOCK"))
+    max_clk_raw = re.findall(r"\d+\.?\d*", _extract_field(scale_ans, "MAX_CLOCK"))
+    min_clock = float(min_clk_raw[0]) if min_clk_raw else 7.5
+    max_clock = float(max_clk_raw[0]) if max_clk_raw else 4.5
+    # Clamp to valid clock range
+    min_clock = max(1.0, min(12.0, min_clock))
+    max_clock = max(1.0, min(12.0, max_clock))
+
+    log.info(f"  Scale: {s_min}–{s_max} {unit}  ({meter_type})")
+    log.info(f"  Clock positions: MIN at {min_clock} o'clock, MAX at {max_clock} o'clock")
+
+    # Step 2 — CV detects needle angle geometrically (ignores printed numbers)
+    log.info("  Step 2 (CV): detecting needle angle …")
+    needle_angle, cx, cy, r = detect_needle_angle(img)
+    log.info(f"  Needle angle: {needle_angle}°  (a_min={clock_to_atan2(min_clock)}°, a_max={clock_to_atan2(max_clock)}°)")
+
+    # Step 3 — Map angle → reading using VLM-calibrated clock positions
+    reading = angle_to_reading(needle_angle, s_min, s_max, min_clock, max_clock)
+    value   = str(reading)
+    raw     = f"{value} {unit}".strip()
+    elapsed = time.time() - t0
+
+    log.info(f"  Done in {elapsed:.1f}s  →  {value} {unit}")
+    return {
+        "meter_type":   meter_type,
+        "scale_range":  f"{int(s_min)}–{int(s_max)}",
+        "raw_reading":  raw,
+        "value":        value,
+        "unit":         unit,
+        "needle_angle": needle_angle,
+        "min_clock":    min_clock,
+        "max_clock":    max_clock,
+        "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -475,6 +634,7 @@ function renderResults(data){
             <tr><td>Type</td>      <td>${r.meter_type}</td></tr>
             <tr><td>Scale</td>     <td>${r.scale_range}</td></tr>
             <tr><td>Raw</td>       <td>${r.raw_reading}</td></tr>
+            <tr><td>Needle</td>    <td>${r.needle_angle}° (${r.min_clock}→${r.max_clock} o'clock)</td></tr>
             <tr><td>Time</td>      <td>${r.timestamp}</td></tr>
           </table>
         </div>

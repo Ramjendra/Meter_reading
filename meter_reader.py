@@ -39,10 +39,17 @@ MODELS = {
 }
 
 COMBINED_PROMPT = (
-    "Look at this analog meter image and answer in exactly this format:\n"
-    "TYPE: <instrument type> | SCALE: <min>-<max> | READING: <value> <unit>\n\n"
-    "Example: TYPE: pressure gauge | SCALE: 0-300 | READING: 120 PSI\n"
-    "Answer for this image:"
+    "You are an expert at reading analog meters. Follow these steps carefully:\n\n"
+    "1. SCALE: Look only at the numbers actually printed on the dial face. "
+    "Report the smallest and largest printed numbers — do NOT infer or add numbers not visible.\n"
+    "2. NEEDLE: Trace the needle from its pivot (center) to its tip. "
+    "Note which printed number or tick mark the tip is closest to.\n"
+    "3. READING: Report only the value the needle tip points at, "
+    "interpolating between ticks if needed.\n\n"
+    "Reply in exactly this one-line format:\n"
+    "TYPE: <type> | SCALE: <min printed>-<max printed> | READING: <needle value> <unit>\n\n"
+    "Example: TYPE: thermometer | SCALE: -20-120 | READING: 95 °C\n\n"
+    "Now read this meter image:"
 )
 
 UNIT_RE = re.compile(
